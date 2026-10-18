@@ -1,0 +1,216 @@
+//! `idx market ...`: the whole board in one call.
+
+use chrono::Datelike;
+use clap::Subcommand;
+
+use crate::error::Result;
+use crate::model::{BrokerSort, CalendarCategory, ForeignSort, Symbol};
+use crate::output::json::{
+    SCHEMA_CALENDAR, SCHEMA_HOLIDAYS, SCHEMA_INDICES, SCHEMA_MARKET, SCHEMA_MARKET_BROKERS,
+    SCHEMA_MARKET_FOREIGN, SCHEMA_MEMBERS,
+};
+use crate::output::table_exchange as tx;
+use crate::output::table_reports as reports;
+use crate::service;
+use crate::universe;
+
+use super::{emit, Context};
+
+#[derive(Debug, Subcommand)]
+pub enum MarketCmd {
+    /// IHSG, breadth, gainers, losers, most traded and heavyweights from one batch of quotes.
+    #[command(
+        after_help = "Examples:\n  idx market overview\n  idx market overview --top 15\n  idx -o json market overview | jq '.data | {index, advancing, declining}'\n\nWalks the bundled universe (~950 tickers) in batched quote calls; gainers and losers are\nlimited to companies above the liquidity floor (--min-mcap) with volume today."
+    )]
+    Overview {
+        /// Rows per list.
+        #[arg(long, short = 'n', default_value_t = 10)]
+        top: usize,
+        /// Market-cap floor for gainers/losers, in IDR (accepts K/M/B/T).
+        #[arg(long, default_value = "1T", value_name = "IDR")]
+        min_mcap: String,
+        /// Index symbol shown at the top.
+        #[arg(long, default_value = "^JKSE", value_name = "INDEX")]
+        index: String,
+        /// CSV of symbol,name to walk instead of the bundled universe.
+        #[arg(long, value_name = "PATH")]
+        universe: Option<std::path::PathBuf>,
+    },
+    /// Every IDX index for one trading day: close, change, range, constituents, value, market cap.
+    #[command(
+        after_help = "Examples:\n  idx market indices\n  idx market indices LQ45 IDX30 IDX80\n  idx market indices --date 2026-10-16\n  idx -o json market indices IHSG | jq '.data.indices[0].close'\n\nFrom idx.co.id's daily index summary (COMPOSITE is IHSG, ^JKSE on Yahoo). Without --date: the\nlatest session published; weekends and holidays are skipped."
+    )]
+    Indices {
+        /// Index codes to keep (LQ45, IDX30, ...; IHSG means COMPOSITE). Default: all.
+        #[arg(value_name = "CODE")]
+        codes: Vec<String>,
+        /// Trading day, YYYY-MM-DD. Default: the latest session.
+        #[arg(long, short = 'd', value_name = "DATE")]
+        date: Option<chrono::NaiveDate>,
+    },
+    /// Foreign net buying and selling across every stock for one session (top foreign / top net).
+    #[command(
+        after_help = "Examples:\n  idx market foreign\n  idx market foreign --top 20 --date 2026-10-16\n  idx market foreign --sort shares\n  idx -o json market foreign | jq '.data.net_buy[0]'\n\nFrom idx.co.id's daily stock summary, latest session by default (weekends and holidays\nskipped). IDX publishes foreign trading in shares; lists are ranked by net shares × close\n(--sort value, a rupiah scale that is not the traded value) or by net shares."
+    )]
+    Foreign {
+        /// Trading day, YYYY-MM-DD. Default: the latest session.
+        #[arg(long, short = 'd', value_name = "DATE")]
+        date: Option<chrono::NaiveDate>,
+        /// Rows per list; 0 for all.
+        #[arg(long, short = 'n', default_value_t = 10)]
+        top: usize,
+        /// Ranking figure.
+        #[arg(long, value_enum, default_value_t = ForeignSort::Value)]
+        sort: ForeignSort,
+    },
+    /// Exchange members ranked by the day's value, volume or frequency (top brokers).
+    #[command(
+        after_help = "Examples:\n  idx market brokers\n  idx market brokers --top 20 --sort frequency\n  idx market brokers --date 2026-10-16 --top 0\n  idx -o json market brokers | jq '.data.brokers[:3]'\n\nFrom idx.co.id's daily broker summary, latest session by default. Each member's buying and\nselling count together, so all members' value is twice the market's. Which stocks a broker\ntraded: `idx bandar broker CODE`; one stock's brokers: `idx broker SYMBOL`."
+    )]
+    Brokers {
+        /// Trading day, YYYY-MM-DD. Default: the latest session.
+        #[arg(long, short = 'd', value_name = "DATE")]
+        date: Option<chrono::NaiveDate>,
+        /// Rows; 0 for every member.
+        #[arg(long, short = 'n', default_value_t = 20)]
+        top: usize,
+        /// Ranking figure.
+        #[arg(long, value_enum, default_value_t = BrokerSort::Value)]
+        sort: BrokerSort,
+    },
+    /// Exchange members (Anggota Bursa): broker codes, names and licences.
+    #[command(
+        after_help = "Examples:\n  idx market members\n  idx market members --search mandiri\n  idx -o json market members | jq '.data.members[] | select(.code==\"YP\")'\n\nFrom idx.co.id's member list; the bundled list (data/brokers.csv) stands in when it cannot\nbe reached. The codes are the ones `idx broker` and `idx bandar` report."
+    )]
+    Members {
+        /// Code or name, case-insensitive substring.
+        #[arg(long, short = 's', value_name = "TEXT")]
+        search: Option<String>,
+    },
+    /// Exchange calendar: dividend and rights dates, RUPS, public exposes, listings (idx.co.id).
+    #[command(
+        after_help = "Examples:\n  idx market calendar                          # the next 14 days\n  idx market calendar --days 30 --type dividend,rights\n  idx market calendar --symbol BBCA --from 2026-01-01 --to 2026-03-31\n  idx market calendar --date 2026-10-19 --type all\n  idx -o json market calendar | jq '.data.events[] | select(.milestone==\"cum\")'\n\nTypes: dividend, rights, bonus, split, warrant, rups, public_expose (expose), buyback, listing,\nbond, other; `all` or `default` (everything but bond events and buyback reports). Type and\nstep (cum, ex, recording, payment, plan, notice, result, ...) are classified by idx from each\nentry's wording. Ranges cover at most 92 days."
+    )]
+    Calendar {
+        /// One day, YYYY-MM-DD (instead of a range).
+        #[arg(long, short = 'd', value_name = "DATE", conflicts_with_all = ["from", "to", "days"])]
+        date: Option<chrono::NaiveDate>,
+        /// Start of the range, YYYY-MM-DD. Default: today.
+        #[arg(long, value_name = "DATE")]
+        from: Option<chrono::NaiveDate>,
+        /// End of the range, YYYY-MM-DD. Default: --from plus --days.
+        #[arg(long, value_name = "DATE", conflicts_with = "days")]
+        to: Option<chrono::NaiveDate>,
+        /// Days to look ahead when --to is not given.
+        #[arg(long, value_name = "N", default_value_t = service::CALENDAR_DEFAULT_DAYS)]
+        days: u32,
+        /// One issuer, e.g. BBCA.
+        #[arg(long, short = 's', value_name = "SYMBOL")]
+        symbol: Option<String>,
+        /// Comma-separated types, `all` or `default`.
+        #[arg(
+            long = "type",
+            short = 't',
+            value_name = "TYPES",
+            default_value = "default"
+        )]
+        types: String,
+    },
+    /// Trading holidays (Kalender Libur Bursa), whether today is a trading day, and the next one.
+    #[command(
+        after_help = "Examples:\n  idx market holidays\n  idx market holidays --year 2027\n  idx market holidays --upcoming\n  idx -o json market holidays | jq '.data.next_trading_day'\n\nBundled from the yearly calendar idx.co.id publishes (weekend holidays are not listed);\nIDX can add a holiday later. Override the list with IDX_HOLIDAYS=/path/to.csv (date,name,name_en)."
+    )]
+    Holidays {
+        /// Calendar year; default: the current year.
+        #[arg(long, value_name = "YEAR", conflicts_with = "all")]
+        year: Option<i32>,
+        /// Every year on the list.
+        #[arg(long)]
+        all: bool,
+        /// Only holidays from today on.
+        #[arg(long)]
+        upcoming: bool,
+    },
+}
+
+pub async fn run(ctx: &Context, cmd: MarketCmd) -> Result<()> {
+    match cmd {
+        MarketCmd::Overview {
+            top,
+            min_mcap,
+            index,
+            universe: path,
+        } => {
+            let floor = crate::analysis::screen::parse_number(&min_mcap).ok_or_else(|| {
+                crate::error::IdxError::Usage(format!(
+                    "--min-mcap {min_mcap:?} is not a number (try 1T, 500B)"
+                ))
+            })?;
+            let index = Symbol::parse(&index)?;
+            let mut list = universe::load(path.as_deref())?;
+            universe::extend_from_ownership(&mut list, &ctx.settings.ownership_db);
+            let result =
+                service::market_overview(ctx.provider.as_ref(), &list, &index, top, floor).await?;
+            emit(ctx, SCHEMA_MARKET, result, |d| {
+                reports::market(d, ctx.color)
+            })
+        }
+        MarketCmd::Indices { codes, date } => {
+            let result = service::indices(&ctx.fetcher, date, &codes, service::today_wib()).await?;
+            emit(ctx, SCHEMA_INDICES, result, |d| tx::indices(d, ctx.color))
+        }
+        MarketCmd::Foreign { date, top, sort } => {
+            let result =
+                service::market_foreign(&ctx.fetcher, date, top, sort, service::today_wib())
+                    .await?;
+            emit(ctx, SCHEMA_MARKET_FOREIGN, result, |d| {
+                tx::market_foreign(d, ctx.color)
+            })
+        }
+        MarketCmd::Brokers { date, top, sort } => {
+            let result =
+                service::market_brokers(&ctx.fetcher, date, top, sort, service::today_wib())
+                    .await?;
+            emit(ctx, SCHEMA_MARKET_BROKERS, result, |d| {
+                tx::market_brokers(d, ctx.color)
+            })
+        }
+        MarketCmd::Members { search } => {
+            let result = service::members(&ctx.fetcher, search.as_deref()).await?;
+            emit(ctx, SCHEMA_MEMBERS, result, |d| tx::members(d, ctx.color))
+        }
+        MarketCmd::Calendar {
+            date,
+            from,
+            to,
+            days,
+            symbol,
+            types,
+        } => {
+            let q = service::CalendarQuery {
+                date,
+                from,
+                to,
+                days: Some(days),
+                symbol,
+                categories: CalendarCategory::parse_list(&types)?,
+            };
+            let result = service::calendar(&ctx.fetcher, &q, service::today_wib()).await?;
+            emit(ctx, SCHEMA_CALENDAR, result, |d| tx::calendar(d, ctx.color))
+        }
+        MarketCmd::Holidays {
+            year,
+            all,
+            upcoming,
+        } => {
+            let today = service::today_wib();
+            let year = if all {
+                None
+            } else {
+                Some(year.unwrap_or(today.year()))
+            };
+            let result = service::holidays(year, upcoming, today)?;
+            emit(ctx, SCHEMA_HOLIDAYS, result, |d| tx::holidays(d, ctx.color))
+        }
+    }
+}
