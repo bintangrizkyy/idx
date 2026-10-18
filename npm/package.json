@@ -1,0 +1,50 @@
+{
+  "name": "ihsg-cli",
+  "version": "0.7.2",
+  "description": "idx: Indonesian stock market (IDX / IHSG) CLI and MCP server for people and AI agents. Downloads the SHA-256 verified prebuilt binary for your platform.",
+  "license": "MIT",
+  "homepage": "https://ihsg.midoriresearch.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fzn0x/idx.git",
+    "directory": "npm"
+  },
+  "bugs": "https://github.com/fzn0x/idx/issues",
+  "keywords": [
+    "ihsg",
+    "idx",
+    "stocks",
+    "indonesia",
+    "saham",
+    "finance",
+    "mcp",
+    "cli",
+    "ai-agents"
+  ],
+  "bin": {
+    "idx": "bin/idx.js",
+    "ihsg-cli": "bin/idx.js"
+  },
+  "files": [
+    "bin/idx.js",
+    "lib/",
+    "install.js",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "Midori Research <desk@midoriresearch.com>"
+}
